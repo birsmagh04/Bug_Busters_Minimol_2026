@@ -8,11 +8,27 @@ const http = require('http');
 let mainWindow = null;
 const appStartTime = Date.now();
 
+// Optional launch arguments let developers run isolated node profiles side by side.
+function getLaunchOption(name) {
+  const prefix = `--hivenet-${name}=`;
+  const arg = process.argv.find(value => value.startsWith(prefix));
+  return arg ? arg.slice(prefix.length) : '';
+}
+
+const nodeProfile = getLaunchOption('profile').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+const launchPort = Number(getLaunchOption('port'));
+const launchNodeName = getLaunchOption('name').trim();
+
 // Storage paths in user application data directory
 // Safe fallback if app.getPath is called before app is ready or in edge conditions
 function getUserDataPath() {
   try {
     if (app && typeof app.getPath === 'function') {
+      if (nodeProfile && typeof app.setPath === 'function') {
+        const profilePath = path.join(app.getPath('appData'), 'HiveNet', `profile-${nodeProfile}`);
+        app.setPath('userData', profilePath);
+        return profilePath;
+      }
       return app.getPath('userData');
     }
   } catch (e) {
@@ -77,36 +93,77 @@ function getDiskCapacity() {
       driveLabel = `Root Volume (${volumeRoot})`;
     }
 
-    if (typeof fs.statfsSync === 'function') {
-      let stats = null;
-      try {
-        stats = fs.statfsSync(measuredPath);
-      } catch {
-        stats = fs.statfsSync(volumeRoot);
+    if (typeof fs.statfsSync !== 'function') throw new Error('Filesystem telemetry is not supported');
+
+    const formatGB = (bytes) => (bytes / (1024 ** 3)).toFixed(1);
+    const readVolume = (root) => {
+      const stats = fs.statfsSync(root);
+      if (!stats || stats.blocks <= 0) return null;
+      const rootLabel = path.parse(path.resolve(root)).root;
+      const blockSize = BigInt(stats.bsize || stats.frsize || 4096);
+      const totalBytes = Number(BigInt(stats.blocks) * blockSize);
+      const freeBlocks = stats.bavail ?? stats.bfree;
+      const freeBytes = Number(BigInt(freeBlocks) * blockSize);
+      const usedBytes = Math.max(0, totalBytes - freeBytes);
+      return {
+        volumeRoot: rootLabel,
+        driveLabel: process.platform === 'win32'
+          ? `Local Disk (${rootLabel.slice(0, 2).toUpperCase()})`
+          : `Root Volume (${rootLabel})`,
+        totalBytes,
+        freeBytes,
+        usedBytes,
+        totalGB: `${formatGB(totalBytes)} GB`,
+        freeGB: `${formatGB(freeBytes)} GB`,
+        usedGB: `${formatGB(usedBytes)} GB`,
+        percentUsed: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0
+      };
+    };
+
+    let storageVolume = readVolume(measuredPath);
+    if (!storageVolume && path.resolve(measuredPath) !== path.resolve(volumeRoot)) {
+      storageVolume = readVolume(volumeRoot);
+    }
+    if (!storageVolume) throw new Error(`Could not read filesystem capacity for ${measuredPath}`);
+
+    let volumes = [storageVolume];
+    if (process.platform === 'win32') {
+      volumes = [];
+      for (const letter of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+        const root = `${letter}:\\`;
+        try {
+          const volume = readVolume(root);
+          if (volume) volumes.push(volume);
+        } catch {
+          // Unavailable letters and unmounted volumes are not local storage.
+        }
       }
-
-      if (stats && stats.blocks > 0) {
-        const blockSize = BigInt(stats.bsize || stats.frsize || 4096);
-        const totalBytes = Number(BigInt(stats.blocks) * blockSize);
-        const freeBytes = Number(BigInt(stats.bavail || stats.bfree) * blockSize);
-        const usedBytes = Math.max(0, totalBytes - freeBytes);
-
-        const formatGB = (bytes) => (bytes / (1024 ** 3)).toFixed(1);
-
-        return {
-          totalBytes,
-          freeBytes,
-          usedBytes,
-          totalGB: `${formatGB(totalBytes)} GB`,
-          freeGB: `${formatGB(freeBytes)} GB`,
-          usedGB: `${formatGB(usedBytes)} GB`,
-          percentUsed: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0,
-          driveLabel: driveLabel,
-          volumeRoot: volumeRoot,
-          measuredDirectory: measuredPath
-        };
+      if (!volumes.some(volume => volume.volumeRoot.toLowerCase() === volumeRoot.toLowerCase())) {
+        volumes.push(storageVolume);
       }
     }
+
+    const totalBytes = volumes.reduce((sum, volume) => sum + volume.totalBytes, 0);
+    const freeBytes = volumes.reduce((sum, volume) => sum + volume.freeBytes, 0);
+    const usedBytes = volumes.reduce((sum, volume) => sum + volume.usedBytes, 0);
+    const volumeNames = volumes.map(volume => volume.volumeRoot.replace('\\', '').toUpperCase());
+
+    return {
+      totalBytes,
+      freeBytes,
+      usedBytes,
+      totalGB: `${formatGB(totalBytes)} GB`,
+      freeGB: `${formatGB(freeBytes)} GB`,
+      usedGB: `${formatGB(usedBytes)} GB`,
+      percentUsed: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0,
+      driveLabel: process.platform === 'win32'
+        ? `This Device (${volumeNames.join(', ')})`
+        : driveLabel,
+      volumeRoot: volumes.length === 1 ? volumeRoot : volumeNames.join(', '),
+      measuredDirectory: measuredPath,
+      volumes,
+      storageVolume
+    };
   } catch (err) {
     console.error('Error reading real disk capacity:', err);
   }
@@ -129,11 +186,22 @@ function getDiskCapacity() {
  * Load or initialize persistent Node Identity
  */
 function loadOrCreateNodeIdentity() {
+  const defaultHostname = os.hostname() || 'HiveNet-Node';
   try {
     if (fs.existsSync(nodeConfigPath)) {
       const raw = fs.readFileSync(nodeConfigPath, 'utf8');
       const data = JSON.parse(raw);
       if (data && data.nodeId) {
+        let changed = false;
+        if (launchPort >= 1024 && launchPort <= 65535 && data.port !== launchPort) {
+          data.port = launchPort;
+          changed = true;
+        }
+        if (launchNodeName && data.nodeName !== launchNodeName) {
+          data.nodeName = launchNodeName;
+          changed = true;
+        }
+        if (changed) fs.writeFileSync(nodeConfigPath, JSON.stringify(data, null, 2), 'utf8');
         return data;
       }
     }
@@ -143,12 +211,10 @@ function loadOrCreateNodeIdentity() {
 
   const randomHex = crypto.randomBytes(8).toString('hex');
   const nodeId = `hive-node-${randomHex}`;
-  const defaultHostname = os.hostname() || 'HiveNet-Node';
-
   const defaultIdentity = {
     nodeId,
-    nodeName: defaultHostname,
-    port: 9001,
+    nodeName: launchNodeName || defaultHostname,
+    port: launchPort >= 1024 && launchPort <= 65535 ? launchPort : 9001,
     createdTimestamp: Date.now(),
     role: 'Full Edge Shard Node'
   };
@@ -377,9 +443,14 @@ function startNodeHttpServer(port) {
       const telemetryPayload = {
         nodeId: currentNodeConfig.nodeId,
         nodeName: currentNodeConfig.nodeName,
-        availableDiskSpace: disk.freeGB,
-        totalDiskSpace: disk.totalGB,
-        usedDiskSpace: disk.usedGB,
+        // Peers use the capacity on the actual HiveNet storage volume for routing.
+        availableDiskSpace: disk.storageVolume?.freeGB || disk.freeGB,
+        totalDiskSpace: disk.storageVolume?.totalGB || disk.totalGB,
+        usedDiskSpace: disk.storageVolume?.usedGB || disk.usedGB,
+        deviceAvailableDiskSpace: disk.freeGB,
+        deviceTotalDiskSpace: disk.totalGB,
+        deviceUsedDiskSpace: disk.usedGB,
+        volumes: disk.volumes,
         driveLabel: disk.driveLabel,
         uptime: uptimeSecs,
         status: 'online'
@@ -579,6 +650,9 @@ function setupIpcHandlers() {
 
       if (!health || !health.nodeId) {
         return { success: false, error: 'Target responded, but does not identify as a valid HiveNet node (missing nodeId)' };
+      }
+      if (health.nodeId === currentNodeConfig.nodeId) {
+        return { success: false, error: 'This address points to the current HiveNet node. Connect to a different node instead.' };
       }
 
       // 2. Real HTTP request to peer's /telemetry endpoint
