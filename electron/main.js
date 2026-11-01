@@ -4,9 +4,12 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const http = require('http');
+const { Transform } = require('stream');
+const { pipeline } = require('stream/promises');
 
 let mainWindow = null;
 const appStartTime = Date.now();
+const selectedFileTokens = new Map();
 
 // Optional launch arguments let developers run isolated node profiles side by side.
 function getLaunchOption(name) {
@@ -42,6 +45,8 @@ const userDataDir = getUserDataPath();
 const edgeStorageDir = path.join(userDataDir, 'edge-storage-shards');
 const nodeConfigPath = path.join(userDataDir, 'node-identity.json');
 const peersConfigPath = path.join(userDataDir, 'peers.json');
+const filesIndexPath = path.join(edgeStorageDir, 'files-index.json');
+const MAX_SHARED_FILE_BYTES = 100 * 1024 * 1024;
 
 // Ensure edge storage and user data directories exist
 try {
@@ -257,6 +262,91 @@ function savePeers(peersList) {
   }
 }
 
+function loadSharedFiles() {
+  try {
+    const records = JSON.parse(fs.readFileSync(filesIndexPath, 'utf8'));
+    return Array.isArray(records) ? records.filter(record => record && /^[0-9a-f-]{36}$/i.test(record.id)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function getSharedFilePath(id) {
+  if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id)) return null;
+  return path.join(edgeStorageDir, `${id}.blob`);
+}
+
+function resolveSelectedFile(token) {
+  if (typeof token !== 'string' || !/^[0-9a-f]{48}$/i.test(token)) return null;
+  const filePath = selectedFileTokens.get(token);
+  if (!filePath) return null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size > MAX_SHARED_FILE_BYTES) return null;
+    return { path: filePath, size: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeSharedFileName(name) {
+  const clean = String(name || 'shared-file').replace(/[\\/\x00-\x1f\x7f]/g, '_').trim();
+  return (clean || 'shared-file').slice(0, 180);
+}
+
+function decodeHeader(value, fallback = '') {
+  try { return decodeURIComponent(String(value || fallback)); } catch { return fallback; }
+}
+
+async function storeSharedFile(input, { name, expectedSize, expectedHash, sourceNodeId, sourceNodeName }) {
+  const id = crypto.randomUUID();
+  const temporaryPath = path.join(edgeStorageDir, `.${id}.upload`);
+  const finalPath = getSharedFilePath(id);
+  const hash = crypto.createHash('sha256');
+  let size = 0;
+  const meter = new Transform({
+    transform(chunk, encoding, callback) {
+      size += chunk.length;
+      if (size > MAX_SHARED_FILE_BYTES) {
+        callback(new Error(`File exceeds the ${MAX_SHARED_FILE_BYTES / (1024 * 1024)} MB sharing limit`));
+        return;
+      }
+      hash.update(chunk);
+      callback(null, chunk);
+    }
+  });
+
+  try {
+    await pipeline(input, meter, fs.createWriteStream(temporaryPath, { flags: 'wx' }));
+    if (Number.isFinite(expectedSize) && size !== expectedSize) {
+      throw new Error('The received file size did not match the sender’s file size');
+    }
+    const sha256 = hash.digest('hex');
+    if (expectedHash && expectedHash.toLowerCase() !== sha256) {
+      throw new Error('File integrity check failed (SHA-256 mismatch)');
+    }
+
+    fs.renameSync(temporaryPath, finalPath);
+    const record = {
+      id,
+      name: sanitizeSharedFileName(name),
+      size,
+      sha256,
+      uploadedAt: new Date().toISOString(),
+      sourceNodeId: sourceNodeId || currentNodeConfig.nodeId,
+      sourceNodeName: sourceNodeName || currentNodeConfig.nodeName
+    };
+    const files = loadSharedFiles();
+    files.unshift(record);
+    fs.writeFileSync(filesIndexPath, JSON.stringify(files, null, 2), 'utf8');
+    return record;
+  } catch (error) {
+    try { fs.rmSync(temporaryPath, { force: true }); } catch {}
+    try { fs.rmSync(finalPath, { force: true }); } catch {}
+    throw error;
+  }
+}
+
 let connectedPeers = loadPeers();
 
 // -------------------------------------------------------------
@@ -314,6 +404,51 @@ function fetchJsonFromPeer(ip, port, endpoint, timeoutMs = 5000) {
     });
 
     req.end();
+  });
+}
+
+async function getFileSha256(filePath) {
+  const hash = crypto.createHash('sha256');
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+function postFileToPeer(peer, filePath, fileName, size, sha256) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      hostname: peer.ip,
+      port: Number(peer.port),
+      path: '/files',
+      method: 'POST',
+      timeout: 120000,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': size,
+        'X-HiveNet-File-Name': encodeURIComponent(fileName),
+        'X-HiveNet-SHA256': sha256,
+        'X-HiveNet-Source-Node-Id': currentNodeConfig.nodeId,
+        'X-HiveNet-Source-Node-Name': encodeURIComponent(currentNodeConfig.nodeName)
+      }
+    }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => {
+        let result;
+        try { result = JSON.parse(body); } catch { result = {}; }
+        if (response.statusCode >= 200 && response.statusCode < 300 && result.success) {
+          resolve(result);
+        } else {
+          reject(new Error(result.error || `Peer rejected the file (HTTP ${response.statusCode})`));
+        }
+      });
+    });
+
+    request.setTimeout(120000, () => request.destroy(new Error('File transfer timed out')));
+    request.on('error', reject);
+    const source = fs.createReadStream(filePath);
+    source.on('error', error => request.destroy(error));
+    source.pipe(request);
   });
 }
 
@@ -406,8 +541,8 @@ function startNodeHttpServer(port) {
   nodeHttpServer = http.createServer((req, res) => {
     // Enable CORS for P2P interactions
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-HiveNet-File-Name, X-HiveNet-SHA256, X-HiveNet-Source-Node-Id, X-HiveNet-Source-Node-Name');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -426,6 +561,7 @@ function startNodeHttpServer(port) {
         nodeName: currentNodeConfig.nodeName,
         localIp: getLocalIpAddress(),
         port: currentNodeConfig.port,
+        capabilities: { fileSharingVersion: 1 },
         status: 'online',
         uptime: uptimeSecs
       };
@@ -458,6 +594,75 @@ function startNodeHttpServer(port) {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(telemetryPayload));
+      return;
+    }
+
+    // GET /files lists files stored on this node.
+    if (req.method === 'GET' && pathname === '/files') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(loadSharedFiles().filter(file => fs.existsSync(getSharedFilePath(file.id)))));
+      return;
+    }
+
+    // POST /files receives a file stream and verifies size and checksum before publishing it.
+    if (req.method === 'POST' && pathname === '/files') {
+      const contentLength = Number(req.headers['content-length']);
+      if (Number.isFinite(contentLength) && contentLength > MAX_SHARED_FILE_BYTES) {
+        req.resume();
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `File exceeds the ${MAX_SHARED_FILE_BYTES / (1024 * 1024)} MB sharing limit` }));
+        return;
+      }
+
+      let fileName = 'shared-file';
+      try {
+        fileName = decodeURIComponent(String(req.headers['x-hivenet-file-name'] || fileName));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid encoded file name' }));
+        req.resume();
+        return;
+      }
+
+      const expectedSize = Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : undefined;
+      storeSharedFile(req, {
+        name: fileName,
+        expectedSize,
+        expectedHash: req.headers['x-hivenet-sha256'],
+        sourceNodeId: String(req.headers['x-hivenet-source-node-id'] || ''),
+        sourceNodeName: req.headers['x-hivenet-source-node-name']
+          ? sanitizeSharedFileName(decodeHeader(req.headers['x-hivenet-source-node-name']))
+          : 'Unknown peer'
+      }).then(file => {
+        if (res.destroyed) return;
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, file, nodeId: currentNodeConfig.nodeId, nodeName: currentNodeConfig.nodeName }));
+      }).catch(error => {
+        console.error('[HiveNet] File receive failed:', error.message);
+        if (res.destroyed) return;
+        const status = /sharing limit/i.test(error.message) ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: error.message || 'Could not store file' }));
+      });
+      return;
+    }
+
+    // GET /files/:id downloads the stored file bytes.
+    const fileMatch = pathname.match(/^\/files\/([0-9a-f-]{36})$/i);
+    if (req.method === 'GET' && fileMatch) {
+      const file = loadSharedFiles().find(record => record.id === fileMatch[1]);
+      const filePath = getSharedFilePath(fileMatch[1]);
+      if (!file || !filePath || !fs.existsSync(filePath)) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Shared file not found' }));
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': file.size,
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`
+      });
+      fs.createReadStream(filePath).pipe(res);
       return;
     }
 
@@ -731,17 +936,76 @@ function setupIpcHandlers() {
     return { success: true, peers: connectedPeers };
   });
 
+  ipcMain.handle('files:list-local', async () => {
+    return loadSharedFiles().filter(file => fs.existsSync(getSharedFilePath(file.id)));
+  });
+
+  ipcMain.handle('files:store-local', async (_, { selectionToken }) => {
+    const selected = resolveSelectedFile(selectionToken);
+    if (!selected) return { success: false, error: 'Select the file again; the selection is no longer available or exceeds the 100 MB limit.' };
+    try {
+      const file = await storeSharedFile(fs.createReadStream(selected.path), {
+        name: path.basename(selected.path),
+        expectedSize: selected.size,
+        sourceNodeId: currentNodeConfig.nodeId,
+        sourceNodeName: currentNodeConfig.nodeName
+      });
+      selectedFileTokens.delete(selectionToken);
+      return { success: true, file };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('files:share-selected', async (_, { selectionToken, peerNodeId }) => {
+    const selected = resolveSelectedFile(selectionToken);
+    if (!selected) return { success: false, error: 'Select the file again; the selection is no longer available or exceeds the 100 MB limit.' };
+    const peer = connectedPeers.find(item => item.nodeId === peerNodeId || item.id === peerNodeId);
+    if (!peer) return { success: false, error: 'Connect to the target node before sharing a file.' };
+
+    try {
+      const healthResult = await fetchJsonFromPeer(peer.ip, peer.port, '/health', 5000);
+      if (healthResult.data?.nodeId !== peer.nodeId) {
+        return { success: false, error: 'The connected peer identity changed. Refresh the peer list and try again.' };
+      }
+      if (Number(healthResult.data?.capabilities?.fileSharingVersion) < 1) {
+        return { success: false, error: 'This peer is running an older HiveNet version without file sharing. Update and restart HiveNet on the receiving computer, then reconnect.' };
+      }
+      const sha256 = await getFileSha256(selected.path);
+      const result = await postFileToPeer(peer, selected.path, path.basename(selected.path), selected.size, sha256);
+      selectedFileTokens.delete(selectionToken);
+      return { success: true, file: result.file, peer: { nodeId: peer.nodeId, nodeName: peer.nodeName, ip: peer.ip, port: peer.port } };
+    } catch (error) {
+      return { success: false, error: error.message || 'File transfer failed' };
+    }
+  });
+
+  ipcMain.handle('files:save-copy', async (_, fileId) => {
+    const file = loadSharedFiles().find(item => item.id === fileId);
+    const sourcePath = getSharedFilePath(fileId);
+    if (!file || !sourcePath || !fs.existsSync(sourcePath)) return { success: false, error: 'Shared file not found on this node.' };
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save a copy of shared file',
+      defaultPath: path.join(app.getPath('downloads'), file.name),
+      buttonLabel: 'Save file'
+    });
+    if (result.canceled || !result.filePath) return { success: false, canceled: true };
+    try {
+      fs.copyFileSync(sourcePath, result.filePath);
+      return { success: true, path: result.filePath };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
   // Native File Picker Dialog
   ipcMain.handle('dialog:select-file', async () => {
     if (!mainWindow) return null;
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: 'Select File to Distribute across HiveNet Edge',
-      buttonLabel: 'Select for Edge Sharding',
+      title: 'Select a file to share with HiveNet nodes',
+      buttonLabel: 'Select file',
       properties: ['openFile'],
-      filters: [
-        { name: 'Images & Media', extensions: ['jpg', 'jpeg', 'png', 'webp', 'svg', 'gif', 'bmp'] },
-        { name: 'All Files', extensions: ['*'] }
-      ]
+      filters: [{ name: 'All Files', extensions: ['*'] }]
     });
 
     if (result.canceled || result.filePaths.length === 0) {
@@ -751,8 +1015,13 @@ function setupIpcHandlers() {
     const filePath = result.filePaths[0];
     try {
       const stats = fs.statSync(filePath);
+      const selectionToken = crypto.randomBytes(24).toString('hex');
+      selectedFileTokens.set(selectionToken, filePath);
+      while (selectedFileTokens.size > 20) {
+        selectedFileTokens.delete(selectedFileTokens.keys().next().value);
+      }
       return {
-        path: filePath,
+        selectionToken,
         name: path.basename(filePath),
         size: stats.size,
         lastModified: stats.mtimeMs,
@@ -761,7 +1030,6 @@ function setupIpcHandlers() {
     } catch (err) {
       console.error('Error reading selected file stats:', err);
       return {
-        path: filePath,
         name: path.basename(filePath),
         size: 0,
         error: err.message
@@ -810,20 +1078,13 @@ function setupIpcHandlers() {
         fs.mkdirSync(edgeStorageDir, { recursive: true });
       }
 
-      const files = fs.readdirSync(edgeStorageDir);
-      let totalBytes = 0;
-      files.forEach(file => {
-        try {
-          const stats = fs.statSync(path.join(edgeStorageDir, file));
-          totalBytes += stats.size;
-        } catch {
-          // ignore broken file ref
-        }
-      });
+      const files = loadSharedFiles().filter(file => fs.existsSync(getSharedFilePath(file.id)));
+      const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
 
       return {
         path: edgeStorageDir,
         shardCount: files.length,
+        fileCount: files.length,
         usedBytes: totalBytes,
         usedFormatted: (totalBytes / (1024 * 1024)).toFixed(2) + ' MB',
         healthy: true
