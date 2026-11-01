@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import SharedFilesView from './SharedFilesView.jsx';
 import { 
   LayoutDashboard, 
   Network, 
@@ -33,7 +34,6 @@ import {
   Trash2,
   AlertCircle
 } from 'lucide-react';
-import { initialMockNodes, mockGalleryItems } from './mockData';
 
 // Helper to format seconds into readable uptime
 function formatUptime(seconds) {
@@ -49,11 +49,13 @@ function formatUptime(seconds) {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [gallery, setGallery] = useState(mockGalleryItems);
+  const [gallery, setGallery] = useState([]);
   const [systemInfo, setSystemInfo] = useState(null);
   const [localEdgeStats, setLocalEdgeStats] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
-  const [simulatedSharding, setSimulatedSharding] = useState(false);
+  const [isSharingFile, setIsSharingFile] = useState(false);
+  const [fileTarget, setFileTarget] = useState('local');
+  const [fileTransferStatus, setFileTransferStatus] = useState(null);
 
   // Real connected peers ONLY (no mock peers)
   const [peers, setPeers] = useState([]);
@@ -90,6 +92,16 @@ export default function App() {
 
   // Check if Electron native bridge is present
   const isElectron = Boolean(window.hiveNetDesktop?.isElectron);
+
+  const fetchSharedFiles = async () => {
+    if (!isElectron || !window.hiveNetDesktop?.listSharedFiles) return;
+    try {
+      const files = await window.hiveNetDesktop.listSharedFiles();
+      if (Array.isArray(files)) setGallery(files);
+    } catch (err) {
+      console.error('Failed to load shared files:', err);
+    }
+  };
 
   // Fetch local Node Identity
   const fetchNodeIdentity = async () => {
@@ -154,6 +166,7 @@ export default function App() {
   useEffect(() => {
     fetchNodeIdentity();
     fetchPeers();
+    fetchSharedFiles();
 
     if (isElectron) {
       window.hiveNetDesktop.getSystemInfo().then(info => {
@@ -172,9 +185,11 @@ export default function App() {
       });
 
       const storageInterval = setInterval(fetchNodeIdentity, 30000);
+      const filesInterval = setInterval(fetchSharedFiles, 5000);
 
       return () => {
         clearInterval(storageInterval);
+        clearInterval(filesInterval);
         if (typeof unsub === 'function') unsub();
       };
     }
@@ -265,12 +280,17 @@ export default function App() {
     if (isElectron) {
       const fileData = await window.hiveNetDesktop.selectFile();
       if (fileData) {
-        setSelectedFile(fileData);
+        if (fileData.error) {
+          setFileTransferStatus({ type: 'error', text: fileData.error });
+        } else {
+          setFileTransferStatus(null);
+          setSelectedFile(fileData);
+        }
       }
     } else {
       const input = document.createElement('input');
       input.type = 'file';
-      input.accept = 'image/*';
+      input.accept = '*/*';
       input.onchange = (e) => {
         const file = e.target.files[0];
         if (file) {
@@ -283,6 +303,36 @@ export default function App() {
       };
       input.click();
     }
+  };
+
+  const handleShareSelectedFile = async () => {
+    if (!isElectron || !selectedFile?.selectionToken) {
+      setFileTransferStatus({ type: 'error', text: 'Select a file from the HiveNet desktop app to share it.' });
+      return;
+    }
+    setIsSharingFile(true);
+    setFileTransferStatus(null);
+    try {
+      const result = fileTarget === 'local'
+        ? await window.hiveNetDesktop.storeFileLocally(selectedFile.selectionToken)
+        : await window.hiveNetDesktop.shareSelectedFile(selectedFile.selectionToken, fileTarget);
+      if (!result?.success) throw new Error(result?.error || 'File sharing failed.');
+      await fetchSharedFiles();
+      const destination = fileTarget === 'local' ? 'this device' : result.peer?.nodeName || 'the peer node';
+      setFileTransferStatus({ type: 'success', text: `${selectedFile.name} was stored on ${destination}.` });
+      setSelectedFile(null);
+    } catch (error) {
+      setFileTransferStatus({ type: 'error', text: error.message || 'File sharing failed.' });
+    } finally {
+      setIsSharingFile(false);
+    }
+  };
+
+  const handleSaveSharedFile = async (fileId) => {
+    if (!isElectron || !window.hiveNetDesktop?.saveSharedFileCopy) return;
+    const result = await window.hiveNetDesktop.saveSharedFileCopy(fileId);
+    if (result?.success) setFileTransferStatus({ type: 'success', text: `Saved a copy to ${result.path}.` });
+    else if (!result?.canceled) setFileTransferStatus({ type: 'error', text: result?.error || 'Could not save the file.' });
   };
 
   const handleOpenStorageFolder = async () => {
@@ -389,7 +439,7 @@ export default function App() {
                 onClick={() => setActiveTab('upload')}
               >
                 <UploadCloud className="icon" size={18} />
-                <span>Upload Image</span>
+                <span>Share a File</span>
               </button>
 
               <button 
@@ -405,7 +455,7 @@ export default function App() {
                 onClick={() => setActiveTab('gallery')}
               >
                 <Image className="icon" size={18} />
-                <span>Shared Gallery</span>
+                <span>Shared Files</span>
                 <span className="badge">{gallery.length}</span>
               </button>
             </div>
@@ -509,12 +559,16 @@ export default function App() {
 
           {activeTab === 'upload' && (
             <UploadImageView 
-              nodes={initialMockNodes} 
               selectedFile={selectedFile}
               onSelectFile={handleSelectNativeFile}
               onClearFile={() => setSelectedFile(null)}
-              simulatedSharding={simulatedSharding}
-              setSimulatedSharding={setSimulatedSharding}
+              peers={peers}
+              nodeIdentity={nodeIdentity}
+              target={fileTarget}
+              setTarget={setFileTarget}
+              isSharing={isSharingFile}
+              status={fileTransferStatus}
+              onShare={handleShareSelectedFile}
               replicationFactor={replicationFactor}
             />
           )}
@@ -528,7 +582,7 @@ export default function App() {
           )}
 
           {activeTab === 'gallery' && (
-            <SharedGalleryView gallery={gallery} />
+            <SharedFilesView files={gallery} onSaveCopy={handleSaveSharedFile} onOpenFolder={handleOpenStorageFolder} status={fileTransferStatus} />
           )}
         </main>
       </div>
@@ -628,17 +682,17 @@ function DashboardView({ nodesCount, totalPool, usedPool, replicationFactor, pee
         <div className="stat-card">
           <div className="stat-card-glow"></div>
           <div className="stat-card-header">
-            <span className="stat-title">Distributed Artifacts</span>
+            <span className="stat-title">Shared Files on This Node</span>
             <div className="stat-icon" style={{ color: '#8b5cf6' }}>
               <Layers size={18} />
             </div>
           </div>
           <div className="stat-value">
             {gallery.length}
-            <span style={{ fontSize: '13px', color: '#94a3b8', fontWeight: 400 }}>images stored</span>
+            <span style={{ fontSize: '13px', color: '#94a3b8', fontWeight: 400 }}>files stored</span>
           </div>
           <div className="stat-desc">
-            <span style={{ color: '#a78bfa' }}>13 total encrypted shards</span> distributed
+            <span style={{ color: '#a78bfa' }}>Available on this node</span>
           </div>
         </div>
       </div>
@@ -1377,114 +1431,53 @@ function ConnectedNodesView({ peers, setPeers, nodeIdentity, onRefreshPeers, isR
   );
 }
 
-function UploadImageView({ nodes, selectedFile, onSelectFile, onClearFile, simulatedSharding, setSimulatedSharding, replicationFactor }) {
-  const triggerShardingSimulation = () => {
-    if (!selectedFile) return;
-    setSimulatedSharding(true);
-    setTimeout(() => {
-      setSimulatedSharding(false);
-      alert('Mock sharding preview complete! Image divided into 4 shards with 2x replication across selected nodes.');
-    }, 1800);
-  };
+function UploadImageView({ selectedFile, onSelectFile, onClearFile, peers, nodeIdentity, target, setTarget, isSharing, status, onShare }) {
+  const onlinePeers = peers.filter(peer => peer.status === 'Online');
+  const targetPeer = onlinePeers.find(peer => (peer.nodeId || peer.id) === target);
+  const destinationName = target === 'local' ? 'This Device' : targetPeer?.nodeName || 'Selected Peer';
 
   return (
     <div>
       <div className="view-header">
-        <h2 className="view-header-title">Upload Image to Distributed Edge</h2>
-        <p className="view-header-subtitle">
-          Select an image from your local filesystem. Files will be broken into cryptographic shards and distributed across edge nodes with {replicationFactor}x redundancy.
-        </p>
+        <h2 className="view-header-title">Share a File Across HiveNet</h2>
+        <p className="view-header-subtitle">Send a file directly to this device or an online HiveNet node. Transfers use the peer’s local HTTP server and verify the file with SHA-256.</p>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: '24px' }}>
-        {/* Upload Box */}
-        <div className="section-box" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '360px', borderStyle: 'dashed', borderWidth: '2px', borderColor: selectedFile ? '#f59e0b' : '#283548', textAlign: 'center', padding: '36px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr', gap: '24px' }}>
+        <div className="section-box" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '300px', borderStyle: 'dashed', borderWidth: '2px', borderColor: selectedFile ? '#f59e0b' : '#283548', textAlign: 'center', padding: '32px' }}>
           <div style={{ width: '64px', height: '64px', borderRadius: '16px', background: 'rgba(245, 158, 11, 0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#f59e0b', marginBottom: '16px' }}>
             <FileUp size={32} />
           </div>
-
           <h3 style={{ fontSize: '18px', fontWeight: 600, color: '#fff', marginBottom: '8px' }}>
-            {selectedFile ? selectedFile.name : 'Choose an image from your computer'}
+            {selectedFile ? selectedFile.name : 'Choose a file to share'}
           </h3>
-
-          <p style={{ fontSize: '13px', color: 'var(--text-muted)', maxWidth: '360px', marginBottom: '20px' }}>
-            {selectedFile 
-              ? `Path: ${selectedFile.path} (${(selectedFile.size / 1024).toFixed(1)} KB)`
-              : 'Standalone desktop integration via Electron native file dialog. No cloud upload will occur.'}
+          <p style={{ fontSize: '13px', color: 'var(--text-muted)', maxWidth: '400px', marginBottom: '20px' }}>
+            {selectedFile ? `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB · 100 MB maximum` : 'Files are sent directly between HiveNet nodes and stored in the receiver’s edge storage folder.'}
           </p>
-
           <div style={{ display: 'flex', gap: '12px' }}>
             <button className="btn-primary" onClick={onSelectFile}>
-              <FolderOpen size={16} />
-              {selectedFile ? 'Change Native File' : 'Browse Local Files'}
+              <FolderOpen size={16} /> {selectedFile ? 'Choose Another File' : 'Browse Files'}
             </button>
-
-            {selectedFile && (
-              <button className="btn-secondary" onClick={onClearFile}>
-                Remove
-              </button>
-            )}
+            {selectedFile && <button className="btn-secondary" onClick={onClearFile}>Remove</button>}
           </div>
         </div>
 
-        {/* Sharding Plan & Strategy Preview */}
         <div className="section-box">
           <div className="section-box-header">
-            <div className="section-title">
-              <Layers size={18} color="#06b6d4" />
-              <span>Edge Sharding Blueprint</span>
-            </div>
-            <span style={{ fontSize: '11px', color: '#f59e0b', background: 'rgba(245, 158, 11, 0.12)', padding: '2px 8px', borderRadius: '6px' }}>
-              2x Redundancy
-            </span>
+            <div className="section-title"><Network size={18} color="#06b6d4" /><span>Transfer Destination</span></div>
+            <span className="badge-status badge-online">Direct peer transfer</span>
           </div>
-
-          <div style={{ fontSize: '13px', color: 'var(--text-muted)', marginBottom: '16px' }}>
-            When activated, the image is decomposed into four Reed-Solomon style parity shards:
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '20px' }}>
-            <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid #202b3d', padding: '10px 14px', borderRadius: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <span style={{ fontFamily: 'var(--font-mono)', color: '#38bdf8' }}>Shard #0 (Header + Block A)</span>
-                <div style={{ fontSize: '11px', color: '#64748b' }}>Assigned to: Local Host Node & Peer Node Alpha</div>
-              </div>
-              <span className="badge-status badge-peer">Replica: 2</span>
-            </div>
-
-            <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid #202b3d', padding: '10px 14px', borderRadius: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <span style={{ fontFamily: 'var(--font-mono)', color: '#38bdf8' }}>Shard #1 (Block B)</span>
-                <div style={{ fontSize: '11px', color: '#64748b' }}>Assigned to: Peer Node Alpha & Peer Node Beta</div>
-              </div>
-              <span className="badge-status badge-peer">Replica: 2</span>
-            </div>
-
-            <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid #202b3d', padding: '10px 14px', borderRadius: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <span style={{ fontFamily: 'var(--font-mono)', color: '#38bdf8' }}>Shard #2 (Block C)</span>
-                <div style={{ fontSize: '11px', color: '#64748b' }}>Assigned to: Peer Node Beta & Gateway Node Gamma</div>
-              </div>
-              <span className="badge-status badge-peer">Replica: 2</span>
-            </div>
-
-            <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid #202b3d', padding: '10px 14px', borderRadius: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <span style={{ fontFamily: 'var(--font-mono)', color: '#38bdf8' }}>Shard #3 (Parity Check)</span>
-                <div style={{ fontSize: '11px', color: '#64748b' }}>Assigned to: Gateway Node Gamma & Mobile Edge Shard #5</div>
-              </div>
-              <span className="badge-status badge-peer">Replica: 2</span>
-            </div>
-          </div>
-
-          <button 
-            className="btn-primary" 
-            style={{ width: '100%', justifyContent: 'center' }}
-            disabled={!selectedFile || simulatedSharding}
-            onClick={triggerShardingSimulation}
-          >
-            {simulatedSharding ? 'Simulating Sharding Distribution...' : 'Simulate Edge Sharding Preview'}
+          <label style={{ display: 'block', color: 'var(--text-muted)', fontSize: '12px', marginBottom: '7px' }}>Store file on</label>
+          <select value={target} onChange={event => setTarget(event.target.value)} style={{ width: '100%', padding: '10px 12px', borderRadius: '7px', background: '#0b1220', border: '1px solid #283548', color: '#e2e8f0', marginBottom: '16px' }}>
+            <option value="local">This Device — {nodeIdentity.nodeName}</option>
+            {onlinePeers.map(peer => <option key={peer.nodeId || peer.id} value={peer.nodeId || peer.id}>{peer.nodeName} — {peer.ip}:{peer.port}</option>)}
+          </select>
+          {target !== 'local' && !targetPeer && <p style={{ color: '#f87171', fontSize: '12px' }}>That peer is not currently online. Refresh peer health or choose another destination.</p>}
+          {onlinePeers.length === 0 && <p style={{ color: 'var(--text-muted)', fontSize: '12px' }}>No online peers are connected. You can store the file on this device or connect a peer in Connected Nodes.</p>}
+          <button className="btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '10px' }} disabled={!selectedFile || isSharing || (target !== 'local' && !targetPeer)} onClick={onShare}>
+            {isSharing ? 'Transferring…' : `Share with ${destinationName}`}
           </button>
+          {status && <div style={{ marginTop: '14px', padding: '10px 12px', borderRadius: '7px', fontSize: '12px', background: status.type === 'error' ? 'rgba(239,68,68,.12)' : 'rgba(16,185,129,.12)', color: status.type === 'error' ? '#f87171' : '#34d399' }}>{status.text}</div>}
         </div>
       </div>
     </div>
@@ -1576,7 +1569,7 @@ function SmartRouterView({ peers, nodeIdentity, replicationFactor }) {
   );
 }
 
-function SharedGalleryView({ gallery }) {
+function LegacySharedGalleryView({ gallery }) {
   return (
     <div>
       <div className="view-header">
