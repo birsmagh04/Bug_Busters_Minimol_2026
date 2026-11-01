@@ -58,6 +58,7 @@ export default function App() {
   // Real connected peers ONLY (no mock peers)
   const [peers, setPeers] = useState([]);
   const [isRefreshingPeers, setIsRefreshingPeers] = useState(false);
+  const [isRefreshingStorage, setIsRefreshingStorage] = useState(false);
 
   // Real Node Identity & Hardware state
   const [nodeIdentity, setNodeIdentity] = useState({
@@ -170,7 +171,10 @@ export default function App() {
         }
       });
 
+      const storageInterval = setInterval(fetchNodeIdentity, 30000);
+
       return () => {
+        clearInterval(storageInterval);
         if (typeof unsub === 'function') unsub();
       };
     }
@@ -199,6 +203,12 @@ export default function App() {
       }
     }
     setTimeout(() => setIsRefreshingPeers(false), 600);
+  };
+
+  const handleRefreshStorage = async () => {
+    setIsRefreshingStorage(true);
+    await fetchNodeIdentity();
+    setIsRefreshingStorage(false);
   };
 
   const handleSaveSettings = async (e) => {
@@ -289,10 +299,10 @@ export default function App() {
   // Real drive storage from native filesystem
   const totalStoragePool = nodeIdentity?.disk?.totalGB && nodeIdentity.disk.totalGB !== 'Loading...'
     ? nodeIdentity.disk.totalGB
-    : '145.6 GB';
+    : 'Loading...';
   const usedStoragePool = nodeIdentity?.disk?.usedGB && nodeIdentity.disk.usedGB !== 'Loading...'
     ? nodeIdentity.disk.usedGB
-    : '118.6 GB';
+    : 'Loading...';
   const replicationFactor = 2;
 
   return (
@@ -465,6 +475,8 @@ export default function App() {
               systemInfo={systemInfo}
               localEdgeStats={localEdgeStats}
               nodeIdentity={nodeIdentity}
+              onRefreshStorage={handleRefreshStorage}
+              isRefreshingStorage={isRefreshingStorage}
             />
           )}
 
@@ -478,6 +490,8 @@ export default function App() {
               systemInfo={systemInfo}
               localEdgeStats={localEdgeStats}
               onOpenFolder={handleOpenStorageFolder}
+              onRefreshStorage={handleRefreshStorage}
+              isRefreshingStorage={isRefreshingStorage}
             />
           )}
 
@@ -526,7 +540,7 @@ export default function App() {
 // Sub-views
 // -------------------------------------------------------------
 
-function DashboardView({ nodesCount, totalPool, usedPool, replicationFactor, peers, gallery, onNavigate, systemInfo, localEdgeStats, nodeIdentity }) {
+function DashboardView({ nodesCount, totalPool, usedPool, replicationFactor, peers, gallery, onNavigate, systemInfo, localEdgeStats, nodeIdentity, onRefreshStorage, isRefreshingStorage }) {
   const driveLabel = nodeIdentity?.disk?.driveLabel || 'Local Disk (C:)';
 
   return (
@@ -566,8 +580,20 @@ function DashboardView({ nodesCount, totalPool, usedPool, replicationFactor, pee
           <div className="stat-card-glow"></div>
           <div className="stat-card-header">
             <span className="stat-title">{driveLabel} Capacity</span>
-            <div className="stat-icon" style={{ color: '#f59e0b' }}>
-              <HardDrive size={18} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <button
+                className="btn-secondary"
+                onClick={onRefreshStorage}
+                disabled={isRefreshingStorage}
+                title="Refresh local disk telemetry"
+                style={{ fontSize: '11px', padding: '4px 7px' }}
+              >
+                <RefreshCw size={12} className={isRefreshingStorage ? 'spin' : ''} />
+                Refresh
+              </button>
+              <div className="stat-icon" style={{ color: '#f59e0b' }}>
+                <HardDrive size={18} />
+              </div>
             </div>
           </div>
           <div className="stat-value">
@@ -575,7 +601,7 @@ function DashboardView({ nodesCount, totalPool, usedPool, replicationFactor, pee
           </div>
           <div className="stat-desc">
             <span style={{ color: '#f59e0b', fontWeight: 600 }}>{usedPool} used</span>
-            <span>• {nodeIdentity?.disk?.freeGB || '27.0 GB'} free</span>
+            <span>• {nodeIdentity?.disk?.freeGB || 'Loading...'} free</span>
           </div>
         </div>
 
@@ -762,7 +788,7 @@ function DashboardView({ nodesCount, totalPool, usedPool, replicationFactor, pee
   );
 }
 
-function MyNodeView({ nodeIdentity, settingsForm, setSettingsForm, onSaveSettings, saveStatus, systemInfo, localEdgeStats, onOpenFolder }) {
+function MyNodeView({ nodeIdentity, settingsForm, setSettingsForm, onSaveSettings, saveStatus, systemInfo, localEdgeStats, onOpenFolder, onRefreshStorage, isRefreshingStorage }) {
   const disk = nodeIdentity?.disk || {};
   const driveLabel = disk.driveLabel || 'Local Disk (C:)';
 
@@ -845,11 +871,16 @@ function MyNodeView({ nodeIdentity, settingsForm, setSettingsForm, onSaveSetting
             <div className="section-box-header">
               <div className="section-title">
                 <HardDrive size={18} color="#10b981" />
-                <span>{driveLabel} Storage Statistics (Live Filesystem)</span>
+                <span>{driveLabel} Storage Statistics (All Local Volumes)</span>
               </div>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="btn-secondary" onClick={onRefreshStorage} disabled={isRefreshingStorage} style={{ fontSize: '12px', padding: '5px 10px' }}>
+                <RefreshCw size={13} className={isRefreshingStorage ? 'spin' : ''} /> Refresh Storage
+              </button>
               <button className="btn-secondary" onClick={onOpenFolder} style={{ fontSize: '12px', padding: '5px 10px' }}>
                 <FolderOpen size={13} /> Open Storage Dir
               </button>
+            </div>
             </div>
 
             <div style={{ marginBottom: '16px' }}>
@@ -879,28 +910,44 @@ function MyNodeView({ nodeIdentity, settingsForm, setSettingsForm, onSaveSetting
               <div style={{ padding: '10px', background: 'rgba(255,255,255,0.02)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
                 <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>Available Free Space</div>
                 <div style={{ fontSize: '16px', fontWeight: 700, color: '#10b981', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
-                  {disk.freeGB}
+                  {disk.freeGB || 'Loading...'}
                 </div>
               </div>
 
               <div style={{ padding: '10px', background: 'rgba(255,255,255,0.02)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
                 <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>Used Disk Space</div>
                 <div style={{ fontSize: '16px', fontWeight: 700, color: '#f59e0b', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
-                  {disk.usedGB}
+                  {disk.usedGB || 'Loading...'}
                 </div>
               </div>
 
               <div style={{ padding: '10px', background: 'rgba(255,255,255,0.02)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
                 <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>Total Drive Capacity</div>
                 <div style={{ fontSize: '16px', fontWeight: 700, color: '#ffffff', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
-                  {disk.totalGB}
+                  {disk.totalGB || 'Loading...'}
                 </div>
               </div>
             </div>
 
+            {Array.isArray(disk.volumes) && disk.volumes.length > 1 && (
+              <div style={{ marginTop: '14px', border: '1px solid var(--border-color)', borderRadius: '8px', overflow: 'hidden' }}>
+                <div style={{ padding: '9px 12px', background: 'rgba(255,255,255,0.03)', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                  Per-drive capacity
+                </div>
+                {disk.volumes.map(volume => (
+                  <div key={volume.volumeRoot} style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr 1fr 1fr', gap: '8px', padding: '9px 12px', borderTop: '1px solid var(--border-color)', fontSize: '12px' }}>
+                    <span style={{ color: '#fbbf24' }}>{volume.driveLabel}</span>
+                    <span>{volume.totalGB} total</span>
+                    <span style={{ color: '#10b981' }}>{volume.freeGB} free</span>
+                    <span style={{ color: '#f59e0b' }}>{volume.usedGB} used</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div style={{ marginTop: '14px', padding: '10px 12px', background: 'rgba(255,255,255,0.02)', borderRadius: '6px', border: '1px solid var(--border-color)', fontSize: '11px' }}>
               <div style={{ color: 'var(--text-muted)', marginBottom: '4px' }}>
-                <strong>Measured Filesystem Directory:</strong>
+                <strong>HiveNet storage directory (peer routing capacity):</strong>
               </div>
               <div style={{ fontFamily: 'var(--font-mono)', color: '#38bdf8', wordBreak: 'break-all' }}>
                 {disk.measuredDirectory || 'AppData\\edge-storage-shards'}
