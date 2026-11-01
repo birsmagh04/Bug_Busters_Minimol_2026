@@ -17,6 +17,12 @@ contextBridge.exposeInMainWorld('hiveNetDesktop', {
     return () => ipcRenderer.removeListener('peers:updated', handler);
   },
 
+  // Verified file sharing through the local node process
+  listSharedFiles: () => ipcRenderer.invoke('files:list-local'),
+  storeFileLocally: (selectionToken) => ipcRenderer.invoke('files:store-local', { selectionToken }),
+  shareSelectedFile: (selectionToken, peerNodeId) => ipcRenderer.invoke('files:share-selected', { selectionToken, peerNodeId }),
+  saveSharedFileCopy: (fileId) => ipcRenderer.invoke('files:save-copy', fileId),
+
   // Native Filesystem dialogs
   selectFile: () => ipcRenderer.invoke('dialog:select-file'),
   selectEdgeDirectory: () => ipcRenderer.invoke('dialog:select-directory'),
