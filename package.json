@@ -6,10 +6,12 @@
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k -r \"npm run dev:vite\" \"npm run dev:electron\"",
+    "dev:two-nodes": "concurrently -k -r \"npm run dev:vite\" \"npm run dev:electron\" \"npm run dev:node2\"",
     "dev:vite": "vite",
-    "dev:electron": "wait-on http://127.0.0.1:5173 && electron .",
+    "dev:electron": "wait-on http://127.0.0.1:5173 && node electron/launch.js",
+    "dev:node2": "wait-on http://127.0.0.1:5173 && node electron/launch.js --hivenet-profile=node-b --hivenet-port=9002 --hivenet-name=HiveNet-Node-B",
     "build": "vite build",
-    "start": "cross-env ELECTRON_RUN_AS_NODE= electron ."
+    "start": "node electron/launch.js"
   },
   "keywords": [
     "edge-storage",
